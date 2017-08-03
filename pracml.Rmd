@@ -1,0 +1,242 @@
+---
+title: "Practical Machine Learning"
+author: "PW"
+date: "30 July 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Executive Summary
+
+The aim of this project is to use the Weight Lifting Exercise dataset and build a prediction model on the various techniques to perform barbell lifts measured by accelerometers.
+Find out more details of the dataset and description [here](http://groupware.les.inf.puc-rio.br/har) (Weight Lifting Exercise Dataset section).
+
+We will use a few models such as classification tree, random forest, boosting and bagging. A cross comparison will be performed in order to select the best model to be applied on the test data. From the out-of-sample accuracy comparison, we find that random forest has the best results among all and will be chosen as the final model to be applied on the test dataset. 
+
+### Data Processing and Analysis
+
+#### About the Dataset
+The dataset consist of 6 participants wearing accelerometers on the belt, forearm, arm and the dumbell. The participants were asked to perform one set of 10 repetitions of biceps curl in five different methods:  
+  1. Class A: Exactly according to the specification  
+  2. Class B: Throwing the elbows to the front  
+  3. Class C: Lifting the dumbell only halfway  
+  4. Class D: Lowering the dumbell only halfway  
+  5. Class E: Throwing the hips to the front
+
+Find out more of the project description [here](http://groupware.les.inf.puc-rio.br/har#ixzz3RDCCaU6P)
+
+``` {r, echo=TRUE, cache=TRUE, warning=FALSE, error=FALSE, message=FALSE}
+# load all required libraries
+library(data.table)
+library(caret)
+library(randomForest)
+library(foreach)
+library(rpart)
+library(rpart.plot)
+library(corrplot)
+library(rattle)
+library(plyr)
+library(ipred)
+library(e1071)
+
+# load train & test dataset
+train <- read.csv("~/Downloads/pml-training.csv", na.strings=c("#DIV/0!"," ", "", "NA", "NAs", "NULL"))
+test <- read.csv("~/Downloads/pml-testing.csv", na.strings=c("#DIV/0!"," ", "", "NA", "NAs", "NULL"))
+
+dim(train)
+dim(test)
+
+# clean the dataset
+trainClean <- train[, -which(names(train) %in% c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window"))]
+
+# remove columns with NAs where imputing is not an option
+trainClean = trainClean[, colSums(is.na(trainClean)) == 0]
+
+# remove variables with 0 or near to 0 variance
+zero_variance =nearZeroVar(trainClean[sapply(trainClean, is.numeric)], saveMetrics=TRUE)
+trainClean = trainClean[, zero_variance[, 'nzv'] == 0]
+
+correlation_matrix <- cor(na.omit(trainClean[sapply(trainClean, is.numeric)]))
+
+dim(correlation_matrix)
+```
+
+```{r, echo=TRUE, cache=TRUE, results="hide"}
+correlationmatrixdegreesoffreedom <- expand.grid(row = 1:52, col = 1:52)
+# return correlation matrix in matrix format
+correlationmatrixdegreesoffreedom$correlation <- as.vector(correlation_matrix)
+removehighcorrelation <- findCorrelation(correlation_matrix, cutoff = .7, verbose = TRUE)
+# this removes highly correlated variables (in psychometric theory .7+ correlation is a high correlation)
+trainClean <- trainClean[, -removehighcorrelation] 
+
+for(i in c(8:ncol(trainClean)-1)) {
+    trainClean[,i] = as.numeric(as.character(trainClean[,i]))}
+
+for(i in c(8:ncol(test)-1)) {
+    test[,i] = as.numeric(as.character(test[,i]))}
+
+# clean dataset will only consist of complete columns
+# for cleaner dataset, user name, timestamps & windows will be removed with blank columns
+features <- colnames(trainClean[colSums(is.na(trainClean)) == 0])[-(1:7)]
+modelling <- trainClean[features]
+
+# final clean dataset ready for modelling
+features
+
+# for cross-validation, split the sample in two to divide training and testing
+iid <- createDataPartition(modelling$classe, p=0.6, list=FALSE )
+training <- modelling[iid,]
+testing <- modelling[-iid,]
+```
+
+### Classification Model
+
+In this section, our plan is to build classification tree, random forest, boosting model and bagging for activity classification and then choose the one with the best the out-of-sample accuracy.
+
+#### Classification Tree
+
+In the first test, we use a regression tree with the method `rpart`.
+
+``` {r, echo=TRUE, cache=TRUE}
+library(rattle)
+library(rpart.plot)
+library(rpart)
+
+# regression tree model
+set.seed(123)
+modTree <- train(classe ~ .,data=training, method="rpart")
+save(modTree,file="modTree.RData")
+
+load("modTree.RData")
+fancyRpartPlot(modTree$finalModel)
+
+# out-of-sample errors of regression tree model using validation dataset 
+predTree <- predict(modTree, testing)
+cm1 <- confusionMatrix(predTree, testing$classe)
+cm1$table
+```
+
+The classification tree model did not perform well. Specifically, it fails to identify the class E (see confusion matrix above) and tends to assign most of cases to the class A.
+
+#### Random Forest
+
+We will use the random forest model here using three fold cross validation in our model here due to computational cost factor. 
+
+``` {r, echo=TRUE, cache=TRUE}
+set.seed(123)
+
+# random forest model
+system.time(modForest <- train(classe ~ ., method = "rf", 
+                data = training, importance = TRUE, 
+                trControl = trainControl(method = "cv", number = 3)))
+save(modForest,file="modForest.RData")
+
+load("modForest.RData")
+variable <- varImp(modForest)
+variable$importance[1:10,]
+
+# out-of-sample errors of random forest model using validation dataset 
+predForest <- predict(modForest, testing)
+cm2 <- confusionMatrix(predForest, testing$classe)
+
+# summary of final model
+plot(modForest)
+```
+
+```{r, echo=TRUE, cache=TRUE}
+plot(varImp(modForest), top = 10)
+```
+
+A list of top ten important variables in the model is shown above in relation to each class of activity.
+
+#### Boosting
+
+For boosting tree model, we will first use three fold cross-validation.
+
+``` {r, echo=TRUE, cache=TRUE, warning=FALSE, error=FALSE, message=FALSE}
+# simple boost tree fitting model
+set.seed(2)
+system.time(modBoost <- train(classe ~ ., 
+                   method = "gbm", 
+                   data = training, 
+                   verbose = FALSE, 
+                   trControl = trainControl(method = "cv", number = 3)))
+save(modBoost,file="modBoost.RData")
+
+load("modBoost.RData")
+
+# out-of-sample errors using validation dataset 
+predBoost <- predict(modBoost, testing)
+cm3 <- confusionMatrix(predBoost, testing$classe)
+cm3$overall
+```
+
+With our dataset, we will generate a grid of 15 combinations and use tuneGrid argument to the training function to use these values as we can also tune over the number of trees and complexity of the tree.
+
+``` {r, echo=TRUE, cache=TRUE}
+## model tuning 
+gbmGrid <- expand.grid(.interaction.depth=(1:3)*2, .n.trees=(1:5)*20, .shrinkage=.1,
+                       .n.minobsinnode = c(10))
+bootControl <- trainControl(number=50)
+set.seed(2)
+gmbFit<- train(classe ~ ., 
+                method = "gbm", 
+                data = training, 
+                verbose = F, 
+                trControl = bootControl, 
+                bag.fraction=0.5,
+                tuneGrid=gbmGrid)
+save(gmbFit,file="gmbFit.RData")
+
+load("gmbFit.RData")
+plot(gmbFit)
+```
+
+
+``` {r, echo=TRUE, cache=TRUE}
+# out-of-sample errors using validation dataset 
+predGMB <- predict(gmbFit, testing)
+cmGMB <- confusionMatrix(predGMB, testing$classe)
+cmGMB$overall
+```
+
+#### Bagging
+
+``` {r, echo=TRUE, cache=TRUE}
+system.time({modBag <- train(classe ~ .,data=training,method="treebag")})
+save(modBag,file="modBag.RData")
+
+load("modBag.RData")
+predBag <- predict(modBag, testing)
+cm4 <- confusionMatrix(predBag, testing$classe)
+varImp(modBag)
+plot(varImp(modBag), top = 10)
+```
+
+#### Prediction Model Selection
+After running all the prediction models, they are summarized in the table below:
+
+``` {r, echo=TRUE, cache=TRUE}
+summa <- data.frame(Tree=cm1$overall[1], 
+                    rf=cm2$overall[1], 
+                    boosting=cm3$overall[1],
+                    bagging=cm4$overall[1])
+summa
+```
+We can see that the random forest model had produced the highest level of accuracy as compared to the other prediction models. Therefore, we will be selecting the random forest model as the model of choice for our prediction on the testing dataset.
+
+### Prediction and Results
+``` {r, echo=TRUE, cache=TRUE}
+testing$classe <- as.character(predict(modForest, testing))
+
+modForest$finalModel
+```
+
+### Conclusion
+
+For this project, we used four types of prediction models to build an accurate prediction model on the "classe" variable of the dataset. The results above had shown that the random forest model produced the highest level of accuracy among the other models during cross validation. 
+
+One suggestion to improve the results of our model performance is to finetune to model's parameters and further explore the features to understand it better. 
